@@ -1,0 +1,395 @@
+#!/usr/bin/python
+#   Copyright 2017 PES University Cloud Computing and Big Data Center
+#
+#   Licensed under the Apache License, Version 2.0 (the "License"); you may
+#   not use this file except in compliance with the License. You may obtain
+#   a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#   License for the specific language governing permissions and limitations
+#   under the License.
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+"""
+Reference : Eexperimental WSGI script from the source code.
+"""
+
+"""
+Flow : Incoming request(s) from UI/CLI are intercepted in __call__ ,
+       based on the request:create, discovery, details, volume attach is called.
+       Note: Gets federated token for remote cloud requests.
+"""
+
+from oslo_config import cfg
+import oslo_i18n as i18n
+from oslo_log import log as logging
+
+from glance.common import config
+from glance.common import wsgi
+from glance import version as gversion
+
+import urlparse
+import urllib
+from urllib import urlencode
+import federator as fed
+
+
+i18n.enable_lazy()
+logging.register_options(cfg.CONF)
+version = gversion.version_info.version_string()
+cfg.CONF(project='glance', prog='glance-api', version=version)
+
+
+idp_group = cfg.OptGroup(name='idp', title='idp credentials')
+idp_auth_url = cfg.StrOpt('auth_url', default='No Data', help='idp auth url')
+idp_project_id = cfg.StrOpt('project_id', default='No Data', help='idp project id ')
+idp_user_id = cfg.StrOpt('user_id', default='No Data', help='idp user ID')
+idp_password = cfg.StrOpt('password', default='No Data', help='idp password')
+#sp_ips = cfg.StrOpt('remote_service_providers_host_addr', default='No Data', help='Use ","seperator for multiple hosts')
+sp_details = cfg.DictOpt('remote_service_providers_details', default={}, help='Use Name:IP and ","seperator for multiple hosts')
+
+CONF = cfg.CONF
+CONF.import_group("profiler", "glance.common.wsgi")
+
+CONF.register_group(idp_group)
+CONF.register_opt(idp_auth_url, idp_group)
+CONF.register_opt(idp_project_id, idp_group)
+CONF.register_opt(idp_user_id, idp_group)
+CONF.register_opt(idp_password, idp_group)
+CONF.register_opt(sp_details, idp_group)
+
+LOG = logging.getLogger(__name__)
+logging.setup(CONF, "glance-api")
+config.set_config_defaults()
+
+wsgi.initialize_glance_store()
+
+import requests
+import json
+import os
+import io
+
+
+class AddsGlanceWsgiMiddleware(object):
+    def __init__(self, app):
+        self.app = app
+
+    def federated_token(self):
+        scoped_token_id, project_id = fed.federate(self.remote_sp_ip,\
+                                      self.remote_sp_id, self.token_data)
+        return scoped_token_id, project_id
+
+
+    def federated_request_build(self, environ):
+    # if remote cloud request, modify request based on service provider details
+        uri = environ['REQUEST_URI']
+        path = urlparse.urlparse(uri).path
+        query = urlparse.urlparse(uri).query
+        params = urlparse.parse_qs(query)
+        #pathsplit = path.split('/')
+        url = headers = ''
+
+        LOG.info(path)
+        for i in range(len(self.pathsplit)):
+            if ('..' in self.pathsplit[i]):
+                colonparts = self.pathsplit[i].split('..')
+                self.pathsplit[i] = colonparts[1]
+                self.remote_sp_ip = colonparts[0]
+
+        for key, value in params.items():
+            for i in  range(len(params[key])):
+                if ('..' in value[i]):
+                    colonparts = value[i].split('..')
+                    params[key][i] = colonparts[1]
+                    self.remote_sp_ip  = colonparts[0]
+
+        if (self.remote_sp_ip != ''):
+            self.get_remote_sp_id(self.remote_sp_ip)
+            fed_scoped_token_id, remote_project_id = self.federated_token()
+            #self.pathsplit[2] = remote_project_id #No project_id for image
+            path = '/'.join(self.pathsplit[:len(self.pathsplit)])
+            query = urllib.urlencode(params, doseq=True)
+            new_path_info = urlparse.urlunparse(("", "", path, "", query, ""))
+            headers = self.get_req_headers(fed_scoped_token_id)
+            url = self.full_url(self.remote_sp_ip, new_path_info)
+            return url, headers
+        else:
+            return '-1', '-1'  #request is for local cloud
+
+    def get_req_headers(self, fed_scoped_token_id):
+
+        if (self.pathsplit[-1] == "file" ):
+            headers = {'User-Agent': 'python-openstackclient',
+                       'Content-Type': 'application/octet-stream',
+                       'x-auth-token': fed_scoped_token_id}
+        else:
+            headers = {'User-Agent': 'python-openstackclient',
+                       'Content-Type': 'application/json',
+                       'Accept': 'application/json',
+                       'x-auth-token': fed_scoped_token_id}
+        return headers
+
+    def full_url(self, remote_sp_ip, new_path_info):
+        url = self.request_scheme + '://' + remote_sp_ip + ':' \
+                                  + self.endpoint_port + new_path_info
+        return url
+
+    def get_remote_sp_id(self, remote_sp_ip):
+        self.remote_sp_id=''
+        for y in self.remote_sp_details.items():
+            if (remote_sp_ip == y[1]):
+                self.remote_sp_id = y[0]
+                break
+        return self.remote_sp_id
+
+
+    def image_create(self, environ, start_response):
+
+        length=int(environ['CONTENT_LENGTH'])
+        body = io.BytesIO(environ['wsgi.input'].read(length))
+        self.data_json = json.loads(body.getvalue())
+        environ['wsgi.input']=body
+        try :
+            LOG.info(self.data_json)
+            remote_image_name =  (self.data_json["name"]).split('..')
+            self.data_json["name"] = remote_image_name[1]
+            self.remote_sp_ip = remote_image_name[0]
+        except:
+             LOG.info("Request is not for Instance creation")
+        url, headers = self.federated_request_build(environ)
+        LOG.info(self.remote_sp_ip)
+        if (self.remote_sp_ip != ''):
+            LOG.info(self.remote_sp_ip)
+            LOG.info(url)
+            LOG.info(headers)
+            LOG.info(self.data_json)
+            data =  io.BytesIO(json.dumps(self.data_json))
+            remote_r = requests.post(url=url, data=data, headers=headers)
+            remote_r_j = json.loads(remote_r.text)
+            try :
+                remote_r_j["image"]["id"] = self.remote_sp_ip +".." \
+                                            + remote_r_j["image"]["id"]
+                remote_r_j["image"]["name"] = self.remote_sp_ip +".." \
+                                          + remote_r_j["image"]["name"]
+            except:
+                LOG.info("Request is not for instance creation")
+            LOG.info(remote_r_j)
+            remote_image_id = remote_r_j["id"]+'..'+self.remote_sp_ip
+            if not os.path.exists('../dcs/img'):
+                os.makedirs('../dcs/img')
+                os.chmod('../dcs/img',0777)
+            file_name = '../dcs/img/'+ remote_image_id
+            os.system('touch %s' %(file_name))
+            os.chmod(file_name, 0666)
+            remote_r = json.dumps(remote_r_j)
+            content_length = sum([len(s) for s in remote_r])
+            response_headers = [("content-type", "application/json"),
+                                ('Content-Length',str(content_length))]
+            start_response('200 OK', response_headers)
+            return remote_r
+        return self.app(environ, start_response)
+
+    def image_load(self, environ, start_response):
+
+        if ( os.path.exists('../dcs/img')):
+            for file in os.listdir('../dcs/img'):
+                remote_img_id_ip = file.split('..')
+                if (self.pathsplit[len(self.pathsplit) - 1] == "file" ):
+                     if (self.pathsplit[len(self.pathsplit) - 2] == \
+                                                  remote_img_id_ip[0]):
+                        self.remote_sp_ip = remote_img_id_ip[1]
+                        break
+                if (self.pathsplit[len(self.pathsplit) - 2] == "images" ):
+                    if (self.pathsplit[len(self.pathsplit) - 1] == \
+                                                 remote_img_id_ip[0]):
+                        self.remote_sp_ip = remote_img_id_ip[1]
+                        break
+            url, headers = self.federated_request_build(environ)
+        if (self.remote_sp_ip != ''):
+            data = environ['wsgi.input']
+            remote_r = requests.put(url=url, data=data, headers=headers)
+            content_length = sum([len(s) for s in remote_r])
+            response_headers = [("content-type", "application/octet-stream"),
+                                ('Content-Length',str(content_length))]
+            start_response('200 OK', response_headers)
+            return remote_r
+        return self.app(environ, start_response)
+
+    def image_discovery(self, environ, start_response):
+    # get the response from local cloud first ,then get from registerd \
+    # remote cloud(s) and merge.
+        if (environ['REQUEST_METHOD'] == 'GET'):
+            r =  self.app(environ, start_response)
+            r_str = "".join(str(x) for x in r)
+            for x in self.remote_sp_details.items():
+                self.remote_sp_ip = x[1]
+                url, headers = self.federated_request_build(environ)
+                remote_r = requests.get(url=url, headers=headers)
+                remote_r_j = json.loads(remote_r.text)
+                if (remote_r_j[remote_r_j.keys()[0]] == []):
+                    LOG.info("No Data from Remote Cloud....")
+                else:
+                    for id in range(len(remote_r_j["images"])):
+                        remote_r_j["images"][id]["id"] = self.remote_sp_ip  \
+                                        + ".." + remote_r_j["images"][id]["id"]
+                        remote_r_j["images"][id]["name"] = self.remote_sp_ip \
+                                      + ".." + remote_r_j["images"][id]["name"]
+                        remote_r_text = json.dumps(remote_r_j["images"][id])
+                        remote_r_e = "}, " + remote_r_text.encode('utf8')[:-1] \
+                                                                          + "}]"
+                        r_str = r_str.replace("}]",  remote_r_e)
+            combined_r = str(r_str)
+            content_length = sum([len(s) for s in combined_r])
+            response_headers = [("content-type", "application/json"),
+                                ('Content-Length',str(content_length))]
+            start_response('200 OK', response_headers)
+            return combined_r
+
+    def image_details(self, environ, start_response):
+    # Get the resource details by checking in cache, local cloud or discovery
+    # in remote cloud(s)
+
+        # Check if image  details already cached
+        if (self.pathsplit[len(self.pathsplit) - 2] == "images"
+                       or self.pathsplit[len(self.pathsplit) - 3] == "images"):
+            if ( os.path.exists('../dcs/img')):
+                for file in os.listdir('../dcs/img'):
+                    remote_img_id_ip = file.split('..')
+                    if (self.pathsplit[len(self.pathsplit) - 1] == \
+                                                remote_img_id_ip[0]):
+                        self.remote_sp_ip = remote_img_id_ip[1]
+                        break
+                    if (self.pathsplit[len(self.pathsplit) - 2] == \
+                                                remote_img_id_ip[0]):
+                        self.remote_sp_ip = remote_img_id_ip[1]
+                        break
+
+        url, headers = self.federated_request_build(environ)
+        LOG.info(url)
+
+        # check if resource is in local cloud
+        if (self.remote_sp_ip == ''):
+            r = self.app(environ, start_response)
+            LOG.info(r)
+            r_str = "".join(str(x) for x in r)
+            if ('404' not in str(r)):
+#                r_j = json.loads(r_str)
+                return r
+#            try :
+#                r_j = json.loads(r_str)
+#                if (str(r_j["itemNotFound"]["code"]) != '404' ):
+#                    LOG.info("Item not Found")
+#            except:
+#                return r
+        if (self.remote_sp_ip !=''):
+            LOG.info(url)
+            LOG.info(headers)
+            remote_r = requests.get(url=url, headers=headers)
+#            remote_r_j = json.loads(remote_r.text)
+        else:
+            # discover the resource in remote cloud(s)
+            for x in self.remote_sp_details.items():
+                self.remote_sp_ip = x[1]
+                url, headers = self.federated_request_build(environ)
+                remote_r = requests.get(url=url, headers=headers)
+                LOG.info(remote_r.text)
+                try:
+                    remote_r_j = json.loads(remote_r.text)
+                    if (remote_r.status_code ==200):
+                        remote_image_id=remote_r_j["id"]+'..'+self.remote_sp_ip
+                        if not os.path.exists('../dcs/img'):
+                            os.makedirs('../dcs/img')
+                            os.chmod('../dcs/img',0777)
+                        file_name = '../dcs/img/'+ remote_image_id
+                        os.system('touch %s' %(file_name))
+                        os.chmod(file_name, 0666)
+                        break
+                except:
+                    pass
+        content_length = sum([len(s) for s in remote_r])
+        if (self.pathsplit[-1] == "file" ):
+            response_headers = [("content-type", "application/octet-stream"),
+                                ('Content-Length',str(content_length))]
+        else:
+#            remote_r_j = json.loads(remote_r.text)
+#            remote_r = json.dumps(remote_r_j)
+            response_headers = [("content-type", "application/json"),
+                                ('Content-Length',str(content_length))]
+
+        start_response('200 OK', response_headers)
+        return remote_r
+
+    def image_delete(self, environ, start_response):
+
+        url, headers = self.federated_request_build(environ)
+        remote_r = '-1'
+        if (self.remote_sp_ip != ''):
+            remote_r = requests.delete(url=url, headers=headers)
+            content_length = sum([len(s) for s in remote_r])
+            response_headers = [("content-type", "application/json"),
+                                ('Content-Length',str(content_length))]
+            start_response('200 OK', response_headers)
+            return remote_r
+        return self.app(environ, start_response)
+
+
+    def __call__(self, environ, start_response):
+        self.remote_sp_details = CONF.idp.remote_service_providers_details
+        #remote_sp_id = remote_sp_ip
+        local_sp_ip = environ['SERVER_ADDR']
+        local_sp_id = local_sp_ip
+        idp_auth_url = CONF.idp.auth_url
+        idp_project_id = CONF.idp.project_id
+        idp_user_id = CONF.idp.user_id
+        idp_password = CONF.idp.password
+        self.endpoint_port = environ['SERVER_PORT']  #9292 default
+        self.request_scheme  = environ['REQUEST_SCHEME'] #http/https
+        self.token_data = [idp_auth_url,idp_project_id,idp_user_id,idp_password]
+
+        path_info = environ['PATH_INFO']
+        self.pathsplit = path_info.split('/')
+        self.remote_sp_ip = ''
+
+
+        LOG.info(environ.items())
+
+        if ('images' in path_info):
+
+            if (environ['REQUEST_METHOD'] == 'POST'):
+                return self.image_create(environ, start_response)
+
+            elif (environ['REQUEST_METHOD'] == 'PUT'):
+                return self.image_load(environ, start_response)
+
+            elif (self.pathsplit[-1] == "images" \
+                           and environ['REQUEST_METHOD'] == 'GET'  ):
+                if(environ['SERVER_ADDR'] != environ['REMOTE_ADDR']):
+                    return self.app(environ, start_response)
+                return self.image_discovery(environ, start_response)
+
+            else:
+                return self.image_details(environ, start_response)
+        if (environ['REQUEST_METHOD'] == 'DELETE'):
+             return self.image_delete(environ, start_response)
+ 
+        r = self.app(environ, start_response)
+        LOG.info("=======================Logging R=======================")
+        LOG.info(r)
+        return r ##self.app(environ, start_response)
+
+app = config.load_paste_app('glance-api')
+application  = AddsGlanceWsgiMiddleware(app)

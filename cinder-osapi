@@ -1,0 +1,417 @@
+#!/usr/bin/python
+#   Copyright 2017 PES University Cloud Computing and Big Data Center
+#
+#   Licensed under the Apache License, Version 2.0 (the "License"); you may
+#   not use this file except in compliance with the License. You may obtain
+#   a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#   License for the specific language governing permissions and limitations
+#   under the License.
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+"""
+Reference : Eexperimental WSGI script from the source code.
+"""
+
+"""
+Flow : Incoming request(s) from UI/CLI are intercepted in __call__ ,
+       based on the request:create, discovery, details, volume attach is called.
+       Note: Gets federated token for remote cloud requests.
+"""
+
+import sys
+from cinder import objects
+from paste import deploy
+
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_service import wsgi
+
+from cinder import i18n
+i18n.enable_lazy()
+
+from cinder.common import config
+from cinder import rpc
+from cinder import version
+from cinder import utils
+import requests
+import json
+import os
+import io
+
+import urlparse
+import urllib
+from urllib import urlencode
+import federator as fed
+
+
+# register idp and sp details for reading configerable parameters from nova.conf
+idp_group = cfg.OptGroup(name='idp', title='idp credentials')
+idp_auth_url = cfg.StrOpt('auth_url', default='No Data', help='idp auth url')
+idp_project_name = cfg.StrOpt('project_name', default='No Data',
+                       help='idp project name ')
+idp_user_name = cfg.StrOpt('user_name', default='No Data', help='idp user name')
+idp_project_id = cfg.StrOpt('project_id', default='No Data',
+                       help='idp project id ')
+idp_user_id = cfg.StrOpt('user_id', default='No Data', help='idp user id')
+idp_password = cfg.StrOpt('password', default='No Data', help='idp password')
+idp_user_domain_name = cfg.StrOpt('user_domain_name', default='No Data',
+                           help='idp user domain name')
+idp_project_domain_name = cfg.StrOpt('project_domain_name', default='No Data',
+                              help='idp project domain name')
+sp_details = cfg.DictOpt('remote_service_providers_details', default={} ,
+                 help='Use ","seperator for multiple sps')
+
+
+CONF=cfg.CONF
+CONF.register_group(idp_group)
+CONF.register_opt(idp_auth_url, idp_group)
+CONF.register_opt(idp_project_name, idp_group)
+CONF.register_opt(idp_user_name, idp_group)
+CONF.register_opt(idp_project_id, idp_group)
+CONF.register_opt(idp_user_id, idp_group)
+CONF.register_opt(idp_password, idp_group)
+CONF.register_opt(idp_project_domain_name, idp_group)
+CONF.register_opt(idp_user_domain_name, idp_group)
+CONF.register_opt(sp_details, idp_group)
+
+
+CONF(default_config_files=['/etc/cinder/cinder.conf','/etc/cinder/api-paste.ini'])
+
+CONF("", project='cinder', version=version.version_string())
+
+LOG = logging.getLogger(__name__)
+logging.setup(CONF,"cinder")
+
+config.set_middleware_defaults()
+objects.register_all()
+
+rpc.init(CONF)
+
+conf = '/etc/cinder/api-paste.ini'
+name = "osapi_volume"
+
+class AddsCinderMiddleware(object):
+    def __init__(self, app):
+        self.app = app
+
+    def federated_token(self):
+        scoped_token_id, project_id = fed.federate(self.remote_sp_ip,\
+                                      self.remote_sp_id, self.token_data)
+        return scoped_token_id, project_id
+
+
+    def federated_request_build(self, environ):
+    # if remote cloud request, modify request based on service provider details
+        uri = environ['REQUEST_URI']
+        path = urlparse.urlparse(uri).path
+        query = urlparse.urlparse(uri).query
+        params = urlparse.parse_qs(query)
+        #pathsplit = path.split('/')
+        url = headers = ''
+
+        LOG.info(path)
+        for i in range(len(self.pathsplit)):
+            if ('..' in self.pathsplit[i]):
+                colonparts = self.pathsplit[i].split('..')
+                self.pathsplit[i] = colonparts[1]
+                self.remote_sp_ip = colonparts[0]
+
+        for key, value in params.items():
+            for i in  range(len(params[key])):
+                if ('..' in value[i]):
+                    colonparts = value[i].split('..')
+                    params[key][i] = colonparts[1]
+                    self.remote_sp_ip  = colonparts[0]
+
+        if (self.remote_sp_ip != ''):
+            self.get_remote_sp_id(self.remote_sp_ip)
+            fed_scoped_token_id, remote_project_id = self.federated_token()
+            self.pathsplit[2] = remote_project_id
+            path = '/'.join(self.pathsplit[:len(self.pathsplit)])
+            query = urllib.urlencode(params, doseq=True)
+            new_path_info = urlparse.urlunparse(("", "", path, "", query, ""))
+            headers = self.get_req_headers(fed_scoped_token_id)
+            url = self.full_url(self.remote_sp_ip, new_path_info)
+            return url, headers
+        else:
+            return '-1', '-1'  #request is for local cloud
+
+    def get_req_headers(self, fed_scoped_token_id):
+        headers = {'User-Agent': 'python-openstackclient',
+                   'Content-Type': 'application/json',
+                   'Accept': 'application/json',
+                   'x-auth-token': fed_scoped_token_id}
+        return headers
+
+    def full_url(self, remote_sp_ip, new_path_info):
+        url = self.request_scheme + '://' + remote_sp_ip + ':' \
+                                  + self.endpoint_port + new_path_info
+        return url
+
+    def get_remote_sp_id(self, remote_sp_ip):
+        self.remote_sp_id=''
+        for y in self.remote_sp_details.items():
+            if (remote_sp_ip == y[1]):
+                self.remote_sp_id = y[0]
+                break
+        return self.remote_sp_id
+
+    def volume_map(self, remote_r_j):
+        for key in remote_r_j.keys():
+            for id  in range(len(remote_r_j[key])):
+                try :
+                    remote_r_j[key][id]["name"] = self.remote_sp_ip  + ".." \
+                                                 + remote_r_j[key][id]["name"]
+                    remote_r_j[key][id]["id"] = self.remote_sp_ip  + ".." \
+                                                 + remote_r_j[key][id]["id"]
+                    remote_r_j[key][id]["availability_zone"] = self.remote_sp_ip \
+                              +  ":" + remote_r_j[key][id]["availability_zone"]
+                except :
+                    pass
+                    if (self.pathsplit[len(self.pathsplit) - 1] == \
+                                              "os-availability-zone"):
+                        remote_r_j[key][id]["zoneName"] = self.remote_sp_ip  \
+                                         + ":" + remote_r_j[key][id]["zoneName"]
+
+        remote_r_text = json.dumps(remote_r_j[key])
+        return remote_r_text
+
+    def volume_discovery(self, environ, start_response):
+    # get the response from local cloud first ,then get from registerd \
+    # remote cloud(s) and merge.
+        LOG.info(self.remote_sp_ip)
+        if (environ['REQUEST_METHOD'] == 'GET'):
+            r =  self.app(environ, start_response)
+            r_str = "".join(str(x) for x in r)
+            r_j = json.loads(r_str)
+            remote_r_c = '  '
+            remote_r_e=''
+            for x in self.remote_sp_details.items():
+                self.remote_sp_ip = x[1]
+                LOG.info(self.remote_sp_ip)
+                url, headers = self.federated_request_build(environ)
+                remote_r = requests.get(url=url, headers=headers)
+                remote_r_j = json.loads(remote_r.text)
+                LOG.info(remote_r.text)
+                if (remote_r_j[remote_r_j.keys()[0]] == []):
+                    LOG.info("No Data from Remote Cloud....")
+                else:
+                    remote_r_text = self.volume_map(remote_r_j)
+                    if (r_j[r_j.keys()[0]] == []):
+                        r_str = json.dumps(remote_r_j)
+                    else:
+                        r_str = r_str [:-3]
+                        remote_r_e = "}, " \
+                             + remote_r_text.encode('utf8')[1:][:-1] + "]}"
+
+                    r_str = r_str + remote_r_e
+            combined_r = str(r_str)
+            content_length = sum([len(s) for s in combined_r])
+            response_headers = [("content-type", "application/json"),
+                                ('Content-Length',str(content_length))]
+            start_response('200 OK', response_headers)
+            LOG.info(combined_r)
+            return combined_r
+
+    def volume_create(self, environ, start_response):
+
+        try:
+            self.new_length=int(environ['CONTENT_LENGTH'])
+            body = io.BytesIO(environ['wsgi.input'].read(self.new_length))
+            self.data_json = json.loads(body.getvalue())
+            LOG.info(self.data_json)
+            environ['wsgi.input']=body
+        except:
+            pass
+
+        if (environ['REQUEST_METHOD'] == 'POST'):
+            try :
+                remote_az =(self.data_json["volume"]["availability_zone"]).split(':')
+                self.data_json["volume"]["availability_zone"] = remote_az[1]
+                self.remote_sp_ip = remote_az[0]
+            except:
+                 pass
+            try :
+                value = (self.data_json["volume"]["source_volid"]).split('..')
+                self.data_json["volume"]["source_volid"] = value[1]
+            except :
+                pass
+            try :
+                value = (self.data_json["volume"]["imageRef"]).split('..')
+                self.data_json["volume"]["imageRef"] = value[1]
+            except :
+                pass
+
+
+            if (self.pathsplit[len(self.pathsplit) - 1] == "action"):
+                if os.path.exists('../dcs/vol'):
+                    for file in os.listdir('../dcs/vol'):
+                        remote_vol_id_ip = file.split('..')
+                        if (self.pathsplit[len(self.pathsplit) - 2]==remote_vol_id_ip[0]):
+                            self.remote_sp_ip = remote_vol_id_ip[1]
+                            break
+            LOG.info(self.data_json)
+            url, headers = self.federated_request_build(environ)
+            LOG.info(self.remote_sp_ip)
+            if (self.remote_sp_ip != ''):
+                LOG.info(self.remote_sp_ip)
+                LOG.info(url)
+                LOG.info(headers)
+                LOG.info(self.data_json)
+                data =  io.BytesIO(json.dumps(self.data_json))
+                remote_r = requests.post(url=url, data=data, headers=headers)
+                try:
+                    remote_r_j = json.loads(remote_r.text)
+                    remote_r_j["volume"]["name"] = self.remote_sp_ip +".." + \
+                                                 remote_r_j["volume"]["name"]
+                    remote_r = json.dumps(remote_r_j)
+                except:
+                    LOG.info("Request is not for instance creation")
+                content_length = sum([len(s) for s in remote_r])
+                response_headers = [("content-type", "application/json"),
+                                    ('Content-Length',str(content_length))]
+                start_response('200 OK', response_headers)
+                return remote_r
+        return self.app(environ, start_response)
+
+    def volume_details(self, environ, start_response):
+    # Get the resource details by checking in cache, local cloud or discovery
+    # in remote cloud(s)
+
+        # Check if volume  details already cached
+        if os.path.exists('../dcs/vol'):
+            for file in os.listdir('../dcs/vol'):
+                remote_vol_id_ip = file.split('..')
+                if (self.pathsplit[len(self.pathsplit) - 1] == remote_vol_id_ip[0]):
+                    self.remote_sp_ip = remote_vol_id_ip[1]
+                    break
+        url, headers = self.federated_request_build(environ)
+
+        # check if resource is in local cloud
+        if (self.remote_sp_ip == ''):
+            r = self.app(environ, start_response)
+            r_str = "".join(str(x) for x in r)
+            r_j = json.loads(r_str)
+            try :
+                if (str(r_j["itemNotFound"]["code"]) != '404' ):
+                    LOG.info("Item not Found")
+            except:
+                return r
+        if (self.remote_sp_ip !=''):
+            LOG.info(url)
+            LOG.info(headers)
+            remote_r = requests.get(url=url, headers=headers)
+            remote_r_j = json.loads(remote_r.text)
+        else:
+            # discover the resource in remote cloud(s)
+            for x in self.remote_sp_details.items():
+                self.remote_sp_ip = x[1]
+                url, headers = self.federated_request_build(environ)
+                remote_r = requests.get(url=url, headers=headers)
+                remote_r_j = json.loads(remote_r.text)
+                if (remote_r.status_code ==200):
+                    remote_vol_id=remote_r_j["volume"]["id"]+'..' \
+                                                 +self.remote_sp_ip
+                    if not os.path.exists('../dcs/vol'):
+                        os.makedirs('../dcs/vol')
+                        os.chmod('../dcs/vol',0777)
+                    file_name  = '../dcs/vol/' + remote_vol_id
+                    os.system('touch %s' %(file_name))
+                    os.chmod(file_name, 0666)
+                    break
+        try :
+            for key in remote_r_j.keys():
+                remote_r_j[key]["name"] = self.remote_sp_ip  + ".." \
+                                            + remote_r_j[key]["name"]
+#                remote_r_j[key]["id"] = self.remote_sp_ip  + ".." \
+#                                            + remote_r_j[key]["id"]
+        except :
+            LOG.info("No Mapping needed")
+        remote_r = json.dumps(remote_r_j)
+        content_length = sum([len(s) for s in remote_r])
+        response_headers = [("content-type", "application/json"),
+                            ('Content-Length',str(content_length))]
+        start_response('200 OK', response_headers)
+        return remote_r
+
+    def volume_delete(self, environ, start_response):
+
+        url, headers = self.federated_request_build(environ)
+        if (self.remote_sp_ip != ''):
+            remote_r = requests.delete(url=url, headers=headers)
+            content_length = sum([len(s) for s in remote_r])
+            response_headers = [("content-type", "application/json"),
+                                ('Content-Length',str(content_length))]
+            start_response('200 OK', response_headers)
+            return remote_r
+        return self.app(environ, start_response)
+
+    def __call__(self, environ, start_response):
+    #Intercepts the request from UI/CLI
+
+        # read the config parameters from nova.conf
+        self.remote_sp_details = CONF.idp.remote_service_providers_details
+        self.local_sp_ip = environ['SERVER_ADDR']
+        self.idp_auth_url = CONF.idp.auth_url
+        self.idp_project_name = CONF.idp.project_name
+        self.idp_user_name = CONF.idp.user_name
+        self.idp_project_id = CONF.idp.project_id
+        self.idp_user_id = CONF.idp.user_id
+        self.idp_password = CONF.idp.password
+        self.idp_user_domain_name = CONF.idp.user_domain_name
+        self.idp_project_domain_name = CONF.idp.project_domain_name
+        self.endpoint_port = environ['SERVER_PORT']  #8776 default
+        self.request_scheme  = environ['REQUEST_SCHEME'] #http/https
+        self.token_data = [self.idp_auth_url,self.idp_project_id,\
+                                self.idp_user_id,self.idp_password]
+
+        LOG.info(environ.items())
+        path_info = environ['PATH_INFO']
+        self.pathsplit = path_info.split('/')
+        self.remote_sp_ip = ''
+
+        if (self.pathsplit[len(self.pathsplit) - 1] == "volumes" ):
+            return self.volume_create(environ, start_response)
+        elif (self.pathsplit[len(self.pathsplit) - 1] == "action" ):
+            return self.volume_create(environ, start_response)
+
+        elif (self.pathsplit[-1] == "detail" or self.pathsplit[-1] == \
+                                      "os-availability-zone"):
+
+            if(environ['SERVER_ADDR'] != environ['REMOTE_ADDR']):
+                return self.app(environ, start_response)
+            else:
+                return self.volume_discovery(environ, start_response)
+        elif (environ['REQUEST_METHOD'] == 'DELETE'):
+             return self.volume_delete(environ, start_response)
+
+        else:
+            if ('volumes' in path_info and self.pathsplit[-1] != "detail"):
+                return self.volume_details(environ, start_response)
+
+        # if request is not for remote cloud(s) pass to local cloud
+        r = self.app(environ, start_response)
+        LOG.info("=======================Logging R=======================")
+        LOG.info(r)
+        return r ##self.app(environ, start_response)
+
+app = deploy.loadapp('config:%s' % conf, name=name)
+application  = AddsCinderMiddleware(app)
+
+

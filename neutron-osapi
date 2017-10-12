@@ -1,0 +1,337 @@
+#!/usr/bin/python
+#   Copyright 2017 PES University Cloud Computing and Big Data Center
+#
+#   Licensed under the Apache License, Version 2.0 (the "License"); you may
+#   not use this file except in compliance with the License. You may obtain
+#   a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#   License for the specific language governing permissions and limitations
+#   under the License.
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+"""
+Reference : Experimental WSGI script from the source code.
+"""
+
+"""
+Flow : Incoming request(s) from UI/CLI are intercepted in __call__ ,
+       based on the request:create, discovery, details  is called.
+       Note: Gets federated token for remote cloud requests.
+"""
+
+import eventlet
+from oslo_config import cfg
+from oslo_log import log as logging
+from neutron import wsgi
+from neutron.common import config
+from neutron.common import eventlet_utils
+from neutron.conf import common as common_config
+from neutron.common import rpc as n_rpc
+from neutron import service
+from neutron import manager
+from neutron import context
+#from oslo_context import context 
+
+idp_group = cfg.OptGroup(name='idp', title='idp credentials')
+idp_auth_url = cfg.StrOpt('auth_url', default='No Data', help='idp auth url')
+idp_project_id = cfg.StrOpt('project_id', default='No Data', help='idp project id ')
+idp_user_id = cfg.StrOpt('user_id', default='No Data', help='idp user ID')
+idp_password = cfg.StrOpt('password', default='No Data', help='idp password')
+#sp_ips = cfg.StrOpt('remote_service_providers_host_addr', default='No Data', help='Use ","seperator for multiple hosts')
+sp_details = cfg.DictOpt('remote_service_providers_details', default={}, help='Use Name..IP and ","seperator for multiple hosts')
+
+
+CONF = cfg.CONF
+
+CONF.register_group(idp_group)
+CONF.register_opt(idp_auth_url, idp_group)
+CONF.register_opt(idp_project_id, idp_group)
+CONF.register_opt(idp_user_id, idp_group)
+CONF.register_opt(idp_password, idp_group)
+CONF.register_opt(sp_details, idp_group)
+
+#cfg.CONF(project='neutron')
+LOG = logging.getLogger(__name__)
+logging.setup(CONF,'neutron')
+#config.set_config_defaults()
+#profiler.setup('neutron-server', cfg.CONF.host)
+
+eventlet_utils.monkey_patch()
+
+#LOG.info(cfg.CONF)
+
+cfg.CONF(['--config-file', '/etc/neutron/neutron.conf','--config-file', '/etc/neutron/plugins/ml2/ml2_conf.ini'])
+#config.parse(['--config-file', '/etc/neutron/neutron.conf','--config-file', '/etc/neutron/plugins/ml2/ml2_conf.ini'])
+n_rpc.init(cfg.CONF)
+#wsgi_eventlet.start_api_and_rpc_workers(service.NeutronApiService)
+manager.init()
+service.start_all_workers()
+#worker_launcher = service.start_all_workers()
+#pool = eventlet.GreenPool()
+#plugin_workers_thread = pool.spawn(worker_launcher.wait)
+
+
+
+import requests
+import json
+import os
+import io
+import urlparse
+import urllib
+from urllib import urlencode
+import federator as fed
+
+class AddsNeutronMiddleware(object):
+    def __init__(self, app):
+        self.app = app
+
+    def federated_token(self):
+        scoped_token_id, project_id = fed.federate(self.remote_sp_ip,\
+                                      self.remote_sp_id, self.token_data)
+        return scoped_token_id, project_id
+
+    def federated_request_build(self, environ):
+    # if remote cloud request, modify request based on service provider details
+        uri = environ['REQUEST_URI']
+        path = urlparse.urlparse(uri).path
+        query = urlparse.urlparse(uri).query
+        params = urlparse.parse_qs(query)
+        #pathsplit = path.split('/')
+        url = headers = ''
+
+        LOG.info(path)
+        for i in range(len(self.pathsplit)):
+            if ('..' in self.pathsplit[i]):
+                colonparts = self.pathsplit[i].split('..')
+                self.pathsplit[i] = colonparts[1]
+                self.remote_sp_ip = colonparts[0]
+
+        for key, value in params.items():
+            for i in  range(len(params[key])):
+                if ('..' in value[i]):
+                    colonparts = value[i].split('..')
+                    params[key][i] = colonparts[1]
+                    if (self.remote_sp_ip == ''):
+                        self.remote_sp_ip  = colonparts[0]
+
+        if (self.remote_sp_ip != ''):
+            self.get_remote_sp_id(self.remote_sp_ip)
+            fed_scoped_token_id, remote_project_id = self.federated_token()
+            #self.pathsplit[2] = remote_project_id
+            path = '/'.join(self.pathsplit[:len(self.pathsplit)])
+            if ('tenant_id' in params):
+                    params['tenant_id'] = remote_project_id
+            query = urllib.urlencode(params, doseq=True)
+            new_path_info = urlparse.urlunparse(("", "", path, "", query, ""))
+            headers = self.get_req_headers(fed_scoped_token_id)
+            url = self.full_url(self.remote_sp_ip, new_path_info)
+            return url, headers
+        else:
+            return '-1', '-1'  #request is for local cloud
+    def get_req_headers(self, fed_scoped_token_id):
+        headers = {'User-Agent': 'python-openstackclient',
+                   'Content-Type': 'application/json',
+                   'Accept': 'application/json',
+                   'x-auth-token': fed_scoped_token_id}
+        return headers
+
+    def full_url(self, remote_sp_ip, new_path_info):
+        url = self.request_scheme + '://' + remote_sp_ip + ':' \
+                                  + self.endpoint_port + new_path_info
+        return url
+
+    def get_remote_sp_id(self, remote_sp_ip):
+        self.remote_sp_id=''
+        for y in self.remote_sp_details.items():
+            if (remote_sp_ip == y[1]):
+                self.remote_sp_id = y[0]
+                break
+        return self.remote_sp_id
+
+    def resource_map(self, remote_r_j):
+        for key in remote_r_j.keys():
+            for id  in range(len(remote_r_j[key])):
+                try:
+                    remote_r_j[key][id]["id"] = self.remote_sp_ip  + ".." \
+                                                + remote_r_j[key][id]["id"]
+                    remote_r_j[key][id]["name"] = self.remote_sp_ip  + ".." \
+                                                + remote_r_j[key][id]["name"]
+                except:
+                    pass
+                try :
+                    remote_r_j[key][id]["subnets"][0] = self.remote_sp_ip + ".."  \
+                                           + remote_r_j[key][id]["subnets"][0]
+                except :
+                    pass
+                try :
+                    remote_r_j[key][id]["network_id"] = self.remote_sp_ip + ".." \
+                                          + remote_r_j[key][id]["network_id"]
+                except :
+                    pass
+                try :
+                    remote_r_j[key][id]["device_id"] = self.remote_sp_ip + ".." \
+                                          + remote_r_j[key][id]["device_id"]
+                    remote_r_j[key][id]["fixed_ips"][0]["subnet_id"] = \
+                                              self.remote_sp_ip + ".." \
+                             + remote_r_j[key][id]["fixed_ips"][0]["subnet_id"]
+                except :
+                    pass
+            try:
+                remote_r_j[key]["id"] = self.remote_sp_ip  + ".." \
+                                            + remote_r_j[key]["id"]
+                remote_r_j[key]["name"] = self.remote_sp_ip  + ".." \
+                                          + remote_r_j[key]["name"]
+            except:
+                pass
+            try :
+                remote_r_j[key]["subnets"][0] = self.remote_sp_ip + ".."  \
+                                       + remote_r_j[key]["subnets"][0]
+            except :
+                pass
+            try :
+                remote_r_j[key]["network_id"] = self.remote_sp_ip + ".." \
+                                      + remote_r_j[key]["network_id"]
+            except :
+                pass
+            try :
+                remote_r_j[key]["device_id"] = self.remote_sp_ip + ".." \
+                                      + remote_r_j[key]["device_id"]
+                remote_r_j[key]["fixed_ips"][0]["subnet_id"] = \
+                                      self.remote_sp_ip + ".." \
+                            + remote_r_j[key]["fixed_ips"][0]["subnet_id"]
+            except :
+                pass
+
+        if (self.pathsplit[-2] == "networks" \
+                               or self.pathsplit[-2] == "subnets" \
+                               or self.pathsplit[-2] == "ports"):
+            remote_r_text = json.dumps(remote_r_j)
+        else:
+            remote_r_text = json.dumps(remote_r_j[key])
+        return remote_r_text
+
+#    def resource_create(self, environ, start_response):
+
+    def resource_discovery(self, environ, start_response):
+
+        if (environ['REQUEST_METHOD'] == 'GET'):
+                if(environ['SERVER_ADDR'] != environ['REMOTE_ADDR']):
+                    return self.app(environ, start_response)
+
+                r =  self.app(environ, start_response)
+                r_str = "".join(str(x) for x in r)
+                r_l = json.loads(r_str)
+                LOG.info(r)
+                for x in self.remote_sp_details.items():
+                    LOG.info(x)
+                    self.remote_sp_ip = x[1]
+                    LOG.info(self.remote_sp_ip)
+                    url, headers = self.federated_request_build(environ)
+                    LOG.info(url)
+                    LOG.info(headers)
+                    remote_r = requests.get(url=url, headers=headers)
+                    remote_r_j = json.loads(remote_r.text)
+                    if (remote_r_j[remote_r_j.keys()[0]] == []):
+                        LOG.info("No Data from Remote Cloud....")
+                    else:
+                        remote_r_text = self.resource_map(remote_r_j)
+                        if (r_l[r_l.keys()[0]] == []):
+                            r_str = json.dumps(remote_r_j)
+                        else:
+                            r_str = r_str [:-3]
+                            LOG.info(r_str)
+                            remote_r_e = "}, " + remote_r_text.encode('utf8')[1:][:-1] \
+                                                                                 + "]}"
+                            r_str = r_str + remote_r_e
+                combined_r = str(r_str)
+                LOG.info(combined_r)
+                content_length = sum([len(s) for s in combined_r])
+                response_headers = [("content-type", "application/json"),
+                                    ('Content-Length',str(content_length))]
+                start_response('200 OK', response_headers)
+                return combined_r
+        return self.app(environ, start_response)
+
+    def resource_details(self, environ, start_response):
+        url, headers = self.federated_request_build(environ)
+        if (self.remote_sp_ip != ''):
+            remote_r = requests.get(url=url, headers=headers)
+            remote_r_j = json.loads(remote_r.text)
+            remote_r = self.resource_map(remote_r_j)
+            content_length = sum([len(s) for s in remote_r])
+            response_headers = [("content-type", "application/json"), 
+                                ('Content-Length',str(content_length))]
+            start_response('200 OK', response_headers)
+            LOG.info(remote_r)
+            return remote_r
+        return self.app(environ, start_response)
+
+    def __call__(self, environ, start_response):
+    #Intercepts the request from UI/CLI
+
+        # read the config parameters from neutorn.conf
+        self.remote_sp_details = CONF.idp.remote_service_providers_details
+        self.idp_auth_url = CONF.idp.auth_url
+        self.idp_project_id = CONF.idp.project_id
+        self.idp_user_id = CONF.idp.user_id
+        self.idp_password = CONF.idp.password
+        self.endpoint_port = environ['SERVER_PORT']  #8774 default
+        self.request_scheme  = environ['REQUEST_SCHEME'] #http/https
+        self.token_data = [self.idp_auth_url,self.idp_project_id,\
+                                self.idp_user_id,self.idp_password]
+
+        LOG.info(environ.items())
+        LOG.info("context values")
+        
+
+        #ctx = context.RequestContext()
+        #LOG.info(ctx)
+        #LOG.info(context.Context(tenant_id))
+        #tenant_id = req.headers.get('X_PROJECT_ID')
+        #ctx = context.ContextBase(oslocontext.RequestContext())
+        #LOG.info(ctx.project_id())
+
+        #LOG.info(context.Context.tenant_id())
+        path_info = environ['PATH_INFO']
+        self.pathsplit = path_info.split('/')
+        self.remote_sp_ip = ''
+        remote_r = ''
+
+        if (self.pathsplit[-1] == "networks.json" \
+                               or self.pathsplit[-1] == "networks" \
+                               or self.pathsplit[-1] == "subnets.json" 
+                               or self.pathsplit[-1] == "subnets"\
+                               or self.pathsplit[-1] == "ports.json" \
+                               or self.pathsplit[-1] == "ports"):
+            return self.resource_discovery(environ, start_response)
+
+        LOG.info("Before In call for details...................")
+        if (environ['QUERY_STRING'] == ''):
+            if (self.pathsplit[-2] == "networks" \
+                                   or self.pathsplit[-2] == "subnets" \
+                                   or self.pathsplit[-2] == "ports"):
+                LOG.info("In call for details...................")
+                return self.resource_details(environ, start_response)
+
+       # r = self.app(environ, start_response)
+       # LOG.info(r)
+       # LOG.info(type(r))
+       # return r
+        return self.app(environ, start_response)
+app = config.load_paste_app('neutron')
+application  = AddsNeutronMiddleware(app)
