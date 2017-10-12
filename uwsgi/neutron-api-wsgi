@@ -25,12 +25,12 @@
 #    under the License.
 
 """
-Reference : Experimental WSGI script from the source code.
+Reference : Eexperimental WSGI script from the source code.
 """
 
 """
 Flow : Incoming request(s) from UI/CLI are intercepted in __call__ ,
-       based on the request:create, discovery, details  is called.
+       based on the request:create, discovery, details, volume attach is called.
        Note: Gets federated token for remote cloud requests.
 """
 
@@ -43,9 +43,9 @@ from neutron.common import eventlet_utils
 from neutron.conf import common as common_config
 from neutron.common import rpc as n_rpc
 from neutron import service
+from neutron.common import profiler
 from neutron import manager
-from neutron import context
-#from oslo_context import context 
+
 
 idp_group = cfg.OptGroup(name='idp', title='idp credentials')
 idp_auth_url = cfg.StrOpt('auth_url', default='No Data', help='idp auth url')
@@ -94,7 +94,7 @@ import io
 import urlparse
 import urllib
 from urllib import urlencode
-import federator as fed
+import dcs.federator as fed
 
 class AddsNeutronMiddleware(object):
     def __init__(self, app):
